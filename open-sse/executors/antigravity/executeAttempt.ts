@@ -31,6 +31,8 @@ import {
   removeHeaderCaseInsensitive,
 } from "../../services/antigravityClientProfile.ts";
 import * as prl from "../../utils/providerRequestLogging.ts";
+import { withAntigravityTiming, timeAntigravityFetch } from "../../services/antigravityTiming.ts";
+import * as timingLog from "@/sse/utils/logger";
 import { generateAntigravityRequestId } from "../../services/antigravityIdentity.ts";
 import {
   createCreditsExtractionTransform as createCreditsExtractionTransformImpl,
@@ -155,22 +157,51 @@ export function isAbortError(error: unknown): boolean {
  * SSE readiness is checked separately after headers arrive.
  * Shared by every fetch attempt in executeOnce() (initial, 403-retry, credits-retry).
  */
+type PhysicalSendTiming = { correlationId: string | null; ordinal: number };
+
+function observeTimedAntigravitySend(
+  metadata: HttpAttemptMetadata,
+  send: () => Promise<Response>,
+  signal?: AbortSignal | null,
+  timing?: PhysicalSendTiming
+): Promise<Response> {
+  // The feature is off by default. The outer HTTP-attempt collector must see
+  // the final response wrapper so response-to-attempt correlation still works.
+  return prl.observeProviderHttpSend(metadata, () => {
+    if (
+      process.env.OMNIROUTE_ANTIGRAVITY_TIMING_TELEMETRY !== "true" ||
+      !metadata.connectionId
+    ) return send();
+    return withAntigravityTiming({
+      enabled: true,
+      connectionId: metadata.connectionId,
+      model: metadata.model,
+      correlationId: timing?.correlationId,
+      physicalSendOrdinal: timing?.ordinal,
+      emit: (event) => timingLog.info("ANTIGRAVITY_TIMING", "Antigravity physical-send timing", event),
+    }, () => timeAntigravityFetch(send, signal));
+  });
+}
+
 export async function fetchAntigravityWithReadinessTimeout(
   url: string,
   init: RequestInit,
   timeoutMs = FETCH_TIMEOUT_MS,
-  metadata?: HttpAttemptMetadata
+  metadata?: HttpAttemptMetadata,
+  timing?: PhysicalSendTiming
 ): Promise<Response> {
   const boundedTimeoutMs = Math.max(0, Math.floor(timeoutMs));
   if (boundedTimeoutMs <= 0) {
-    return prl.observeProviderHttpSend(
+    return observeTimedAntigravitySend(
       metadata ?? {
         provider: "antigravity",
         model: "unknown",
         connectionId: null,
         endpoint: "antigravity_generate",
       },
-      () => fetch(url, init)
+      () => fetch(url, init),
+      init.signal,
+      timing
     );
   }
 
@@ -185,14 +216,16 @@ export async function fetchAntigravityWithReadinessTimeout(
     : timeoutController.signal;
 
   try {
-    return await prl.observeProviderHttpSend(
+    return await observeTimedAntigravitySend(
       metadata ?? {
         provider: "antigravity",
         model: "unknown",
         connectionId: null,
         endpoint: "antigravity_generate",
       },
-      () => fetch(url, { ...init, signal: combinedSignal })
+      () => fetch(url, { ...init, signal: combinedSignal }),
+      combinedSignal,
+      timing
     );
   } catch (error) {
     if (
@@ -422,7 +455,8 @@ export async function sendAntigravityRequest(
       model: getRequestTargetModel(transformedBody),
       connectionId: credentials.connectionId ?? null,
       endpoint: "antigravity_generate",
-    }
+    },
+    { correlationId, ordinal: physicalSendOrdinal }
   );
 
   if (response.status === HTTP_STATUS.FORBIDDEN && finalHeaders["x-goog-user-project"]) {
@@ -450,7 +484,8 @@ export async function sendAntigravityRequest(
         connectionId: credentials.connectionId ?? null,
         endpoint: "antigravity_generate",
         retryReason: "quota_header_removed_after_403",
-      }
+      },
+      { correlationId, ordinal: retryPhysicalSendOrdinal }
     );
     finalHeaders = retryHeaders;
   }
@@ -514,7 +549,8 @@ export async function sendAntigravityRequest(
               model: reResolvedModel,
               connectionId: credentials.connectionId ?? null,
               endpoint: "antigravity_generate",
-            }
+            },
+            { correlationId, ordinal: syncRetryPhysicalSendOrdinal }
           );
           finalHeaders = retryHeaders;
         }
@@ -616,7 +652,8 @@ export async function tryCreditsRetry(
         model: getRequestTargetModel(creditsBody),
         connectionId: credentials.connectionId ?? null,
         endpoint: "antigravity_generate",
-      }
+      },
+      { correlationId, ordinal: creditsPhysicalSendOrdinal }
     );
     if (creditsResp.ok || creditsResp.status !== HTTP_STATUS.RATE_LIMITED) {
       log.info("AG_CREDITS", `Credits retry succeeded: ${creditsResp.status}`);
